@@ -2,7 +2,10 @@ const timeOutHandler = new Object();
 const inputPrefix = 'stackapi_input_';
 const feedbackPrefix = 'stackapi_fb_';
 const validationPrefix = 'stackapi_val_';
+let mathjaxPromise = Promise.resolve();
+const requestLanguage = 'en';
 // const stack_api_url = // This is pulled from the publication file
+
 
 const stackstring = {
   "teacheranswershow_mcq":"A correct answer is: {$a->display}",
@@ -14,7 +17,8 @@ const stackstring = {
   "generalfeedback":"General feedback",
   "score":"Score",
   "api_response":"Response summary",
-  "api_correct":"Correct answers"
+  "api_correct":"Correct answers",
+  "api_questionnote": "Question note",
 };
 
 
@@ -57,30 +61,51 @@ function collectAnswer(qprefix) {
 }
 
 // Return object of values of valid entries in an HTMLCollection.
+// Store _val fields with their full name (stripped of qprefix+inputPrefix) so the API receives them correctly.
 function processNodes(res, nodes, qprefix) {
   for (let i = 0; i < nodes.length; i++) {
     const element = nodes[i];
-    if (element.name.indexOf(qprefix+inputPrefix) === 0 && element.name.indexOf('_val') === -1) {
+    if (element.name.indexOf(qprefix + inputPrefix) === 0 && !element.name.endsWith('_val')) {
       if (element.type === 'checkbox' || element.type === 'radio') {
         if (element.checked) {
-          res[element.name.slice((qprefix+inputPrefix).length)] = element.value;
+          res[element.name.slice((qprefix + inputPrefix).length)] = element.value;
         }
       } else {
-        res[element.name.slice((qprefix+inputPrefix).length)] = element.value;
+        res[element.name.slice((qprefix + inputPrefix).length)] = element.value;
       }
+    }
+    if (element.name.indexOf(qprefix + inputPrefix) === 0 && element.name.endsWith('_val')) {
+      res[element.name.slice((qprefix + inputPrefix).length)] = element.value;
     }
   }
   return res;
 }
 
+// Show or hide a loading state on the question identified by qprefix.
+function loading(qprefix, isLoading) {
+  const container = document.getElementById(`${qprefix}stack`);
+  if (!container) return;
+  const buttons = container.querySelectorAll('input[type="button"]');
+  const spinner = document.getElementById(`${qprefix}stackapi_spinner`);
+  for (const btn of buttons) {
+    btn.disabled = isLoading;
+  }
+  if (spinner) {
+    spinner.style.display = isLoading ? 'inline' : 'none';
+  }
+}
+
 // Display rendered question and solution.
 function send(qfile, qname, qprefix) {
+  loading(qprefix, true);
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/render';
   http.open("POST", url, true);
   http.setRequestHeader('Content-Type', 'application/json');
+  http.setRequestHeader('Accept-Language', requestLanguage);
   http.onreadystatechange = function() {
     if(http.readyState == 4) {
+      loading(qprefix, false);
       try {
         const json = JSON.parse(http.responseText);
         if (json.message) {
@@ -95,28 +120,43 @@ function send(qfile, qname, qprefix) {
         const inputs = json.questioninputs;
         const seed = json.questionseed;
         let correctAnswers = '';
-        // Show correct answers.
-        for (const [name, input] of Object.entries(inputs)) {
+
+
+        // Use matchAll to replace inputs in document order, preventing substring collisions
+        // (e.g. 'ans1' matching inside 'ans10'). 
+        const placeholders = question.matchAll(/\[\[input:([a-zA-Z][a-zA-Z0-9_]*)\]\]/g);
+        for (const holder of placeholders) {
+          const name = holder[1];
+          const input = inputs[name];
+          if (!input) continue;
+
           question = question.replace(`[[input:${name}]]`, input.render);
-          // question = question.replaceAll(`${inputPrefix}`,`${qprefix+inputPrefix}`);
-          question = question.replace(`[[validation:${name}]]`, `<span name='${qprefix+validationPrefix + name}'></span>`);
-          // This is a bit of a hack. The question render returns an <a href="..."> calling the download function with
-          // two arguments. We add the additional arguments that we need for context (question definition) here.
+          question = question.replace(`[[validation:${name}]]`, `<span name='${qprefix + validationPrefix + name}'></span>`);
           question = question.replace(/javascript:download\(([^,]+?),([^,]+?)\)/, `javascript:download($1,$2, '${qfile}', '${qname}', '${qprefix}', ${seed})`);
           question = wrap_math(question);
+
           if (input.samplesolutionrender && name !== 'remember') {
-            // Display render of answer and matching user input to produce the answer.
-            correctAnswers += `<p>
-                  ${stackstring['teacheranswershow_mcq']} \\[{${input.samplesolutionrender}}\\],
-                  ${stackstring['api_which_typed']}: `;
-            for (const [name, solution] of Object.entries(input.samplesolution)) {
-              if (name.indexOf('_val') === -1) {
-                correctAnswers += `<span class='correct-answer'>${wrap_math(solution)}</span>`;
+            correctAnswers += `<p>A correct answer is: `;
+            if (input.samplesolutionrender.substring(0, 1) === '<') {
+              correctAnswers += input.samplesolutionrender;
+            } else {
+              correctAnswers += `\\[{${input.samplesolutionrender}}\\]`;
+            }
+            if (input.samplesolution) {
+              let answerOutput = "";
+              for (const [name, solution] of Object.entries(input.samplesolution)) {
+                if (!name.endsWith('_val') &&
+                    !(typeof solution === 'string' && solution.startsWith('[[{"used":'))) {
+                  answerOutput += `<span class='correct-answer'>${wrap_math(solution.replace(/\n/g, '<br>'))}</span>`;
+                }
+              }
+              if (answerOutput) {
+                correctAnswers += `, ${stackstring['api_which_typed']}: ` + answerOutput;
               }
             }
             correctAnswers += '.</p>';
-          } else if (name !== 'remember') {
-            // For dropdowns, radio buttons, etc, only the correct option is displayed.
+          } else if (name !== 'remember' && input.samplesolution) {
+            // For dropdowns, radio buttons, etc., only the correct option is displayed.
             for (const solution of Object.values(input.samplesolution)) {
               if (input.configuration.options) {
                 correctAnswers += `<p class='correct-answer'>${input.configuration.options[solution]}</p>`;
@@ -124,25 +164,40 @@ function send(qfile, qname, qprefix) {
             }
           }
         }
-        // Convert Moodle plot filenames to API filenames.
+
+        // Show or hide the submit button area depending on whether the question has inputs.
+        const elementsRequiringInputs = document.getElementById(`${qprefix}stackapi_qtext`)
+          .querySelectorAll('.noninfo');
+        if (Object.keys(inputs).length) {
+          for (const el of elementsRequiringInputs) {
+            el.style.display = 'inline-block';
+          }
+        } else {
+          for (const el of elementsRequiringInputs) {
+            el.style.display = 'none';
+          }
+        }
+
+      // Convert Moodle plot filenames to API filenames.
         for (const [name, file] of Object.entries(json.questionassets)) {
           const plotUrl = getPlotUrl(file);
           question = question.replace(name, plotUrl);
           json.questionsamplesolutiontext = json.questionsamplesolutiontext.replace(name, plotUrl);
+          if (json.questionnote) {
+            json.questionnote = json.questionnote.replace(name, plotUrl);
+          }
           correctAnswers = correctAnswers.replace(name, plotUrl);
         }
 
-        question = replaceFeedbackTags(question,qprefix);
-        qoutput = document.getElementById(`${qprefix+'output'}`);
+        question = replaceFeedbackTags(question, qprefix);
+        const qoutput = document.getElementById(`${qprefix + 'output'}`);
         qoutput.innerHTML = question;
-        // Only display results sections once question retrieved.
-        document.getElementById(`${qprefix+'stackapi_qtext'}`).style.display = 'block';
-        document.getElementById(`${qprefix+'stackapi_correct'}`).style.display = 'block';
+        document.getElementById(`${qprefix + 'stackapi_qtext'}`).style.display = 'block';
 
-        // Setup a validation call on inputs. Timeout length is reset if the input is updated
-        // before the validation call is made.
+        // Set up a validation call on inputs. Timeout length is reset if the input is
+        // updated before the validation call is made.
         for (const inputName of Object.keys(inputs)) {
-          const inputElements = document.querySelectorAll(`[name^=${qprefix+inputPrefix + inputName}]`);
+          const inputElements = document.querySelectorAll(`[name^=${qprefix + inputPrefix + inputName}]`);
           for (const inputElement of Object.values(inputElements)) {
             inputElement.oninput = (event) => {
               const currentTimeout = timeOutHandler[event.target.id];
@@ -153,44 +208,59 @@ function send(qfile, qname, qprefix) {
             };
           }
         }
+
         let sampleText = json.questionsamplesolutiontext;
         if (sampleText) {
-          sampleText = replaceFeedbackTags(sampleText,qprefix);
-          document.getElementById(`${qprefix+'generalfeedback'}`).innerHTML = wrap_math(sampleText);
-          document.getElementById(`${qprefix+'stackapi_generalfeedback'}`).style.display = 'block';
+          sampleText = replaceFeedbackTags(sampleText, qprefix);
+          document.getElementById(`${qprefix + 'generalfeedback'}`).innerHTML = wrap_math(sampleText);
         } else {
-          // If the question is updated, there may no longer be general feedback.
-          document.getElementById(`${qprefix+'stackapi_generalfeedback'}`).style.display = 'none';
+          document.getElementById(`${qprefix + 'generalfeedback'}`).innerHTML = '';
         }
-        document.getElementById(`${qprefix+'stackapi_score'}`).style.display = 'none';
-        document.getElementById(`${qprefix+'stackapi_validity'}`).innerText = '';
-        const innerFeedback = document.getElementById(`${qprefix+'specificfeedback'}`);
+
+        // Display question note if present.
+        const questionNoteContainer = document.getElementById(`${qprefix + 'stackapi_questionnote'}`);
+        if (questionNoteContainer) {
+          if (json.questionnote) {
+            document.getElementById(`${qprefix + 'questionnote'}`).innerHTML = wrap_math(json.questionnote);
+            questionNoteContainer.style.display = 'block';
+          } else {
+            questionNoteContainer.style.display = 'none';
+          }
+        }
+
+        // Hide result sections until the student submits an answer.
+        document.getElementById(`${qprefix + 'stackapi_generalfeedback'}`).style.display = 'none';
+        document.getElementById(`${qprefix + 'stackapi_score'}`).style.display = 'none';
+        document.getElementById(`${qprefix + 'stackapi_summary'}`).style.display = 'none';
+        document.getElementById(`${qprefix + 'stackapi_correct'}`).style.display = 'none';
+
+        document.getElementById(`${qprefix + 'stackapi_validity'}`).innerText = '';
+        const innerFeedback = document.getElementById(`${qprefix + 'specificfeedback'}`);
         innerFeedback.innerHTML = '';
         innerFeedback.classList.remove('feedback');
-        document.getElementById(`${qprefix+'formatcorrectresponse'}`).innerHTML = correctAnswers;
-
-        // Hide General feedback and correct answers for now
-        document.getElementById(`${qprefix+'stackapi_generalfeedback'}`).style.display = 'none';
-        document.getElementById(`${qprefix+'stackapi_correct'}`).style.display = 'none';
+        document.getElementById(`${qprefix + 'formatcorrectresponse'}`).innerHTML = correctAnswers;
 
         createIframes(json.iframes);
-        MathJax.typeset();
+        triggerMathJax();
       }
-      catch(e) {
+      catch (e) {
         console.log(e);
-        document.getElementById(`${qprefix+'errors'}`).innerText = http.responseText;
+        document.getElementById(`${qprefix + 'errors'}`).innerText = http.responseText;
         return;
       }
     }
   };
-  collectData(qfile, qname, qprefix).then((data)=>{
-    let submitbutton = document.getElementById(`${qprefix + 'stackapi_qtext'}`).querySelector('input[type="button"]');
-    submitbutton.addEventListener('click', function() {answer(qfile, qname, qprefix, data.seed)});
+
+
+  collectData(qfile, qname, qprefix).then((data) => {
+    const submitbutton = document.getElementById(`${qprefix + 'stackapi_qtext'}`).querySelector('input[type="button"]');
+    submitbutton.addEventListener('click', function () { answer(qfile, qname, qprefix, data.seed); }, {once: true});
+    delete data.answers;
     http.send(JSON.stringify(data));
-    let questioncontainer = document.getElementById(`${qprefix+'stack'}`).parentElement;
-    if (questioncontainer.getBoundingClientRect().top<0){
+    const questioncontainer = document.getElementById(`${qprefix + 'stack'}`).parentElement;
+    if (questioncontainer.getBoundingClientRect().top < 0) {
       questioncontainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    };
+    }
   });
 }
 
@@ -199,39 +269,39 @@ function validate(element, qfile, qname, qprefix) {
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/validate';
   http.open("POST", url, true);
-  // Remove API prefix and subanswer id.
-  const answerNamePrefixTrim = (qprefix+inputPrefix).length;
+  const answerNamePrefixTrim = (qprefix + inputPrefix).length;
   const answerName = element.name.slice(answerNamePrefixTrim).split('_', 1)[0];
   http.setRequestHeader('Content-Type', 'application/json');
-  http.onreadystatechange = function() {
-    if(http.readyState == 4) {
+  http.setRequestHeader('Accept-Language', requestLanguage);
+  http.onreadystatechange = function () {
+    if (http.readyState == 4) {
       try {
         const json = JSON.parse(http.responseText);
         if (json.message) {
-          document.getElementById(`${qprefix+'errors'}`).innerText = json.message;
+          document.getElementById(`${qprefix + 'errors'}`).innerText = json.message;
           return;
         } else {
-          document.getElementById(`${qprefix+'errors'}`).innerText = '';
+          document.getElementById(`${qprefix + 'errors'}`).innerText = '';
         }
         renameIframeHolders();
         const validationHTML = json.validation;
-        const element = document.getElementsByName(`${qprefix+validationPrefix + answerName}`)[0];
-        element.innerHTML = wrap_math(validationHTML);
+        const validationElement = document.getElementsByName(`${qprefix + validationPrefix + answerName}`)[0];
+        validationElement.innerHTML = wrap_math(validationHTML);
         if (validationHTML) {
-          element.classList.add('validation');
+          validationElement.classList.add('validation');
         } else {
-          element.classList.remove('validation');
+          validationElement.classList.remove('validation');
         }
         createIframes(json.iframes);
-        MathJax.typeset();
+        triggerMathJax();
       }
-      catch(e) {
-        document.getElementById(`${qprefix+'errors'}`).innerText = http.responseText;
+      catch (e) {
+        document.getElementById(`${qprefix + 'errors'}`).innerText = http.responseText;
         return;
       }
     }
   };
-  collectData(qfile, qname, qprefix).then((data)=>{
+  collectData(qfile, qname, qprefix).then((data) => {
     data.inputName = answerName;
     http.send(JSON.stringify(data));
   });
@@ -239,99 +309,114 @@ function validate(element, qfile, qname, qprefix) {
 
 // Submit answers.
 function answer(qfile, qname, qprefix, seed) {
+  loading(qprefix, true);
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/grade';
   http.open("POST", url, true);
 
-  if (!document.getElementById(`${qprefix+'output'}`).innerText) {
+  if (!document.getElementById(`${qprefix + 'output'}`).innerText) {
+    loading(qprefix, false);
     return;
   }
 
   http.setRequestHeader('Content-Type', 'application/json');
-  http.onreadystatechange = function() {
-    if(http.readyState == 4) {
+  http.setRequestHeader('Accept-Language', requestLanguage);
+  http.onreadystatechange = function () {
+    if (http.readyState == 4) {
+      loading(qprefix, false);
       try {
         const json = JSON.parse(http.responseText);
         if (json.message) {
-          document.getElementById(`${qprefix+'errors'}`).innerText = json.message;
+          document.getElementById(`${qprefix + 'errors'}`).innerText = json.message;
           return;
         } else {
-          document.getElementById(`${qprefix+'errors'}`).innerText = '';
+          document.getElementById(`${qprefix + 'errors'}`).innerText = '';
         }
         if (!json.isgradable) {
-          document.getElementById(`${qprefix+'stackapi_validity'}`).innerText
-              = ' ' + stackstring["api_valid_all_parts"];
+          document.getElementById(`${qprefix + 'stackapi_validity'}`).innerText
+            = ' ' + stackstring["api_valid_all_parts"];
           return;
         }
         renameIframeHolders();
-        document.getElementById(`${qprefix+'score'}`).innerText
-            = (json.score * json.scoreweights.total).toFixed(2) +
-            ' ' + stackstring["api_out_of"] + ' ' + json.scoreweights.total;
-        document.getElementById(`${qprefix+'stackapi_score'}`).style.display = 'block';
-        document.getElementById(`${qprefix+'response_summary'}`).innerText = json.responsesummary;
 
-        // Show General feedback and correct answers, hide summary
-        document.getElementById(`${qprefix+'stackapi_generalfeedback'}`).style.display = 'block';
+        // Show score.
+        document.getElementById(`${qprefix + 'score'}`).innerText
+          = (json.score * json.scoreweights.total).toFixed(2) +
+          ' ' + stackstring["api_out_of"] + ' ' + json.scoreweights.total;
+        document.getElementById(`${qprefix + 'stackapi_score'}`).style.display = 'block';
 
-        document.getElementById(`${qprefix+'stackapi_summary'}`).style.display = 'none';
+        // Show response summary.
+        document.getElementById(`${qprefix + 'response_summary'}`).innerText = json.responsesummary;
+        document.getElementById(`${qprefix + 'stackapi_summary'}`).style.display = 'block';
 
+        // Show general feedback (solution) after submission.
+        document.getElementById(`${qprefix + 'stackapi_generalfeedback'}`).style.display = 'block';
+
+        // Show correct answers after submission.
+        document.getElementById(`${qprefix + 'stackapi_correct'}`).style.display = 'block';
+
+        // Handle specific feedback.
         const feedback = json.prts;
-        const specificFeedbackElement = document.getElementById(`${qprefix+'specificfeedback'}`);
-        // Replace tags and plots in specific feedback and then display.
+        const specificFeedbackElement = document.getElementById(`${qprefix + 'specificfeedback'}`);
         if (json.specificfeedback) {
           for (const [name, file] of Object.entries(json.gradingassets)) {
             json.specificfeedback = json.specificfeedback.replace(name, getPlotUrl(file));
           }
-          json.specificfeedback = replaceFeedbackTags(json.specificfeedback,qprefix);
+          json.specificfeedback = replaceFeedbackTags(json.specificfeedback, qprefix);
           specificFeedbackElement.innerHTML = wrap_math(json.specificfeedback);
           specificFeedbackElement.classList.add('feedback');
         } else {
           specificFeedbackElement.classList.remove('feedback');
         }
-        // Replace plots in tagged feedback and then display.
+
+        // Replace plots in PRT feedback and then display.
         for (let [name, fb] of Object.entries(feedback)) {
-          for (const [name, file] of Object.entries(json.gradingassets)) {
-            fb = fb.replace(name, getPlotUrl(file));
+          for (const [assetName, file] of Object.entries(json.gradingassets)) {
+            fb = fb.replace(assetName, getPlotUrl(file));
           }
-          const elements = document.getElementsByName(`${qprefix+feedbackPrefix + name}`);
+          const elements = document.getElementsByName(`${qprefix + feedbackPrefix + name}`);
           if (elements.length > 0) {
             const element = elements[0];
-            if (json.scores[name] !== undefined) {
+            if (json.scores[name] !== undefined && json.scoreweights[name]) {
               fb = fb + `<div>${stackstring['api_marks_sub']}:
-                    ${(json.scores[name] * json.scoreweights[name] * json.scoreweights.total).toFixed(2)}
-                      / ${(json.scoreweights[name] * json.scoreweights.total).toFixed(2)}.</div>`;
+                ${(json.scores[name] * json.scoreweights[name] * json.scoreweights.total).toFixed(2)}
+                / ${(json.scoreweights[name] * json.scoreweights.total).toFixed(2)}.</div>`;
             }
             element.innerHTML = wrap_math(fb);
-            // if (fb) {
-//                   element.classList.add('feedback');
-//                 } else {
-//                   element.classList.remove('feedback');
-//                 }
+            if (fb) {
+              element.classList.add('feedback');
+            } else {
+              element.classList.remove('feedback');
+            }
           }
         }
+
         createIframes(json.iframes);
-        MathJax.typeset();
+        triggerMathJax();
       }
-      catch(e) {
+      catch (e) {
         console.log(e);
-        document.getElementById(`${qprefix+'errors'}`).innerText = http.responseText;
+        document.getElementById(`${qprefix + 'errors'}`).innerText = http.responseText;
         return;
       }
     }
   };
-  // Clear previous answers and score.
-  const specificFeedbackElement = document.getElementById(`${qprefix+'specificfeedback'}`);
+
+  // Clear previous answers and score before submitting.
+  const specificFeedbackElement = document.getElementById(`${qprefix + 'specificfeedback'}`);
   specificFeedbackElement.innerHTML = "";
   specificFeedbackElement.classList.remove('feedback');
-  document.getElementById(`${qprefix+'response_summary'}`).innerText = "";
-  document.getElementById(`${qprefix+'stackapi_summary'}`).style.display = 'none';
-  const inputElements = document.querySelectorAll(`[name^=${qprefix+feedbackPrefix}]`);
+  document.getElementById(`${qprefix + 'response_summary'}`).innerText = "";
+  document.getElementById(`${qprefix + 'stackapi_summary'}`).style.display = 'none';
+  document.getElementById(`${qprefix + 'stackapi_score'}`).style.display = 'none';
+  document.getElementById(`${qprefix + 'stackapi_correct'}`).style.display = 'none';
+  const inputElements = document.querySelectorAll(`[name^=${qprefix + feedbackPrefix}]`);
   for (const inputElement of Object.values(inputElements)) {
     inputElement.innerHTML = "";
     inputElement.classList.remove('feedback');
   }
-  document.getElementById(`${qprefix+'stackapi_score'}`).style.display = 'none';
-  document.getElementById(`${qprefix+'stackapi_validity'}`).innerText = '';
+  document.getElementById(`${qprefix + 'stackapi_validity'}`).innerText = '';
+
   collectData(qfile, qname, qprefix).then((data) => {
     data.seed = seed;
     http.send(JSON.stringify(data));
@@ -343,17 +428,13 @@ function download(filename, fileid, qfile, qname, qprefix, seed) {
   const url = stack_api_url + '/download';
   http.open("POST", url, true);
   http.setRequestHeader('Content-Type', 'application/json');
-  // Something funky going on with closures and callbacks. This seems
-  // to be the easiest way to pass through the file details.
+  http.setRequestHeader('Accept-Language', requestLanguage);
   http.filename = filename;
   http.fileid = fileid;
-  http.onreadystatechange = function() {
-    if(http.readyState == 4) {
+  http.onreadystatechange = function () {
+    if (http.readyState == 4) {
       try {
-        // Only download the file once. Replace call to download controller with link
-        // to downloaded file.
-        const blob = new Blob([http.responseText], {type: 'application/octet-binary', endings: 'native'});
-        // We're matching the three additional arguments that are added in the send function here.
+        const blob = new Blob([http.responseText], { type: 'application/octet-binary', endings: 'native' });
         const selector = CSS.escape(`javascript\:download\(\'${http.filename}\'\, ${http.fileid}\, \'${qfile}\'\, \'${qname}\'\, \'${qprefix}\'\, ${seed}\)`);
         const linkElements = document.querySelectorAll(`a[href^=${selector}]`);
         const link = linkElements[0];
@@ -361,13 +442,13 @@ function download(filename, fileid, qfile, qname, qprefix, seed) {
         link.setAttribute('download', filename);
         link.click();
       }
-      catch(e) {
+      catch (e) {
         document.getElementById('errors').innerText = http.responseText;
         return;
       }
     }
   };
-  collectData(qfile, qname, qprefix).then((data)=>{
+  collectData(qfile, qname, qprefix).then((data) => {
     data.filename = filename;
     data.fileid = fileid;
     data.seed = seed;
@@ -375,16 +456,14 @@ function download(filename, fileid, qfile, qname, qprefix, seed) {
   });
 }
 
-// Save contents of question editor locally.
 function saveState(key, value) {
-  if (typeof(Storage) !== "undefined") {
+  if (typeof (Storage) !== "undefined") {
     localStorage.setItem(key, value);
   }
 }
 
-// Load locally stored question on page refresh.
 function loadState(key) {
-  if (typeof(Storage) !== "undefined") {
+  if (typeof (Storage) !== "undefined") {
     return localStorage.getItem(key) || '';
   }
   return '';
@@ -398,39 +477,43 @@ function renameIframeHolders() {
   }
 }
 
-function createIframes (iframes) {
-  const corsFragment = "/cors.php?name=";
-
+// Spread iframe args with ...iframe instead of manually passing each argument.
+function createIframes(iframes) {
   for (const iframe of iframes) {
-    create_iframe(
-      iframe[0],
-      iframe[1].replaceAll(corsFragment, stack_api_url + corsFragment),
-      ...iframe.slice(2)
-    );
+    iframe[1] = iframe[1].replace('<head>', `<head><base href="${stack_api_url}/" />`);
+    create_iframe(...iframe);
   }
 }
 
-// Replace feedback tags in some text with an approproately named HTML div.
+// Replace feedback tags in some text with an appropriately named HTML div.
 function replaceFeedbackTags(text, qprefix) {
   let result = text;
   const feedbackTags = text.match(/\[\[feedback:.*?\]\]/g);
   if (feedbackTags) {
     for (const tag of feedbackTags) {
-      // Part name is between '[[feedback:' and ']]'.
-      result = result.replace(tag, `<div name='${qprefix+feedbackPrefix + tag.slice(11, -2)}'></div>`);
+      result = result.replace(tag, `<div name='${qprefix + feedbackPrefix + tag.slice(11, -2)}'></div>`);
     }
   }
   return result;
+}
+
+// Trigger MathJax re-rendering.
+function triggerMathJax() {
+  if (window.MathJax && MathJax.typesetPromise) {
+    mathjaxPromise = mathjaxPromise.then(() => MathJax.typesetPromise()).catch((err) => console.log('MathJax error: ', err.message));
+  } else if (window.MathJax) {
+    MathJax.typeset();
+  }
 }
 
 async function getQuestionFile(questionURL, questionName) {
   let res = "";
   if (questionURL) {
     await fetch(questionURL)
-        .then(result => result.text())
-        .then((result) => {
-          res = loadQuestionFromFile(result, questionName);
-        });
+      .then(result => result.text())
+      .then((result) => {
+        res = loadQuestionFromFile(result, questionName);
+      });
   }
   return res;
 }
@@ -446,12 +529,12 @@ function loadQuestionFromFile(fileContents, questionName) {
       thequestion = question.outerHTML;
       let seeds = question.querySelectorAll('deployedseed');
       if (seeds.length) {
-        randSeed = parseInt(seeds[Math.floor(Math.random()*seeds.length)].textContent);
+        randSeed = parseInt(seeds[Math.floor(Math.random() * seeds.length)].textContent);
       }
       break;
     }
   }
-  return {questionxml:setQuestion(thequestion),seed:randSeed};
+  return { questionxml: setQuestion(thequestion), seed: randSeed };
 }
 
 function setQuestion(question) {
@@ -459,62 +542,68 @@ function setQuestion(question) {
 }
 
 function createQuestionBlocks() {
-  questionBlocks = document.getElementsByClassName("que stack");
-  let i=0;
+  const questionBlocks = document.getElementsByClassName("que stack");
+  let i = 0;
 
-  for (questionblock of questionBlocks){
+  for (const questionblock of questionBlocks) {
     i++;
     let questionPrefix = "q" + i.toString() + "_";
     var qfile = questionblock.dataset.qfile;
     var qname = questionblock.dataset.qname || "";
     questionblock.innerHTML =
-        `
-                <div class="collapsiblecontent" id=${questionPrefix + "stack"}>
-                    <div class="vstack gap-3 ms-3 col-lg-8">
-                        <div id=${questionPrefix + "errors"}></div>
-                        <div id=${questionPrefix + "stackapi_qtext"} class="col-lg-8" style="display: none">
-                          <!--<h2>${stackstring['questiontext']}:</h2>-->
-                          <div id=${questionPrefix + "output"} class="formulation"></div>
-                          <div id=${questionPrefix + "specificfeedback"}></div>
-                          <br>
-                          <!-- <input type="button" onclick="answer('${qfile}', '${qname}', '${questionPrefix}')" class="btn btn-primary" value=${stackstring["api_submit"]}/>-->
-                          <input type="button" class="btn btn-primary" value=${stackstring["api_submit"]}/>
-                          <span id=${questionPrefix + "stackapi_validity"} style="color:darkred"></span>
-                        </div>
-                        <div id=${questionPrefix + "stackapi_generalfeedback"} class="col-lg-8" style="display: none">
-                          <h2>${stackstring['generalfeedback']}:</h2>
-                          <div id=${questionPrefix + "generalfeedback"} class="feedback"></div>
-                        </div>
-                        <h2 id=${questionPrefix + "stackapi_score"} style="display: none">${stackstring['score']}: <span id=${questionPrefix + "score"}></span></h2>
-                        <div id=${questionPrefix + "stackapi_summary"} class="col-lg-10" style="display: none">
-                          <h2>${stackstring['api_response']}:</h2>
-                          <div id=${questionPrefix + "response_summary"} class="feedback"></div>
-                        </div>
-                        <div id=${questionPrefix + "stackapi_correct"} class="col-lg-10" style="display: none">
-                          <h2>${stackstring['api_correct']}:</h2>
-                          <div id=${questionPrefix + "formatcorrectresponse"} class="feedback"></div>
-                        </div>
-                    </div>
-                    <div id=${questionPrefix + "newquestionbutton"}>
-                      <input type="button" onclick="send('${qfile}', '${qname}', '${questionPrefix}')" class="btn btn-primary" value="Show new example question"/>
-                    </div>
-                </div>
-              `;
+      `
+                  <div class="collapsiblecontent" id=${questionPrefix + "stack"}>
+                      <div class="vstack gap-3 ms-3 col-lg-8">
+                          <div id=${questionPrefix + "errors"}></div>
+                          <div id=${questionPrefix + "stackapi_qtext"} class="col-lg-8" style="display: none">
+                            <div id=${questionPrefix + "output"} class="formulation"></div>
+                            <div id=${questionPrefix + "specificfeedback"}></div>
+                            <br>
+                            <span class="noninfo">
+                              <input type="button" class="btn btn-primary" value="${stackstring["api_submit"]}"/>
+                              <span id=${questionPrefix + "stackapi_spinner"} style="display:none" aria-label="Loading">&nbsp;&#9203;</span>
+                            </span>
+                            <span id=${questionPrefix + "stackapi_validity"} style="color:darkred"></span>
+                          </div>
+                          <div id=${questionPrefix + "stackapi_generalfeedback"} class="col-lg-8" style="display: none">
+                            <h2>${stackstring['generalfeedback']}:</h2>
+                            <div id=${questionPrefix + "generalfeedback"} class="feedback"></div>
+                          </div>
+                          <h2 id=${questionPrefix + "stackapi_score"} style="display: none">${stackstring['score']}: <span id=${questionPrefix + "score"}></span></h2>
+                          <div id=${questionPrefix + "stackapi_summary"} class="col-lg-10" style="display: none">
+                            <h2>${stackstring['api_response']}:</h2>
+                            <div id=${questionPrefix + "response_summary"} class="feedback"></div>
+                          </div>
+                          <div id=${questionPrefix + "stackapi_correct"} class="col-lg-10" style="display: none">
+                            <h2>${stackstring['api_correct']}:</h2>
+                            <div id=${questionPrefix + "formatcorrectresponse"} class="feedback"></div>
+                          </div>
+                          <div id=${questionPrefix + "stackapi_questionnote"} class="col-lg-10" style="display: none">
+                            <h2>${stackstring['api_questionnote']}:</h2>
+                            <div id=${questionPrefix + "questionnote"} class="feedback"></div>
+                          </div>
+                      </div>
+                      <div id=${questionPrefix + "newquestionbutton"}>
+                        <input type="button" onclick="send('${qfile}', '${qname}', '${questionPrefix}')" class="btn btn-primary" value="Show new example question"/>
+                        <span id=${questionPrefix + "stackapi_spinner"} style="display:none" aria-label="Loading">&nbsp;&#9203;</span>
+                      </div>
+                  </div>
+                `;
   }
 }
 
-function addCollapsibles(){
+function addCollapsibles() {
   var collapsibles = document.querySelectorAll(".level2>h2, .stack>h2");
-  for (let i=0; i<collapsibles.length; i++) {
+  for (let i = 0; i < collapsibles.length; i++) {
     collapsibles[i].addEventListener("click", () => collapseFunc(this));
   }
 }
 
-function collapseFunc(e){
+function collapseFunc(e) {
   e.classList.toggle("collapsed");
 }
 
-function stackSetup(){
+function stackSetup() {
   createQuestionBlocks();
   addCollapsibles();
 }
