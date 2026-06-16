@@ -19,6 +19,18 @@
  * 4. vle_update_dom() uses MathJax.typesetPromise() instead of Moodle's
  *    CustomEvents.notifyFilterContentUpdated() which does not exist in PreTeXt.
  *
+ * 5. NEW: vle_reset_question_registry(boundaryId) — clears all per-question
+ *    registry state (iframes, input listener maps) for a question before it
+ *    is re-rendered (e.g. "Show new example question"). Without this, a
+ *    freshly created iframe that reuses the same iframe id AND the same
+ *    input element id as the previous instance will be considered "already
+ *    registered" by the stale Q_INPUTS map. The 'register-input-listener'
+ *    handler then `return`s early without ever posting back the
+ *    'initial-input' response, and the iframe's STACK-JS client times out
+ *    after 5s with "No response to input registration of ... in 5s." and
+ *    never renders its drag-and-drop UI. Calling this before createIframes()
+ *    on every render prevents that stale state from persisting.
+ *
  * @copyright  2023 Aalto University
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
@@ -27,7 +39,6 @@
 
 // Per-question registries — keyed by question boundary element id.
 // Each question gets its own isolated IFRAMES, INPUTS, INPUTS_INPUT_EVENT map.
-// This is the core fix for the multi-question interference bug.
 const QUESTION_IFRAMES = {};          // { boundaryId: { iframeId: iframeElement } }
 const QUESTION_INPUTS = {};           // { boundaryId: { inputId: [iframeId, ...] } }
 const QUESTION_INPUTS_INPUT_EVENT = {}; // { boundaryId: { inputId: [iframeId, ...] } }
@@ -51,6 +62,39 @@ function getQuestionRegistry(boundaryId) {
   };
 }
 
+/**
+ * Clear all registry state associated with a question boundary.
+ *
+ * Called by stackapicalls.js immediately before re-rendering a question's
+ * iframes (initial render, "Show new example question", or any re-render
+ * that calls createIframes() again for the same boundary).
+ *
+ * This:
+ *  - removes stale IFRAMES[...] entries for any iframe ids previously
+ *    registered under this boundary (so a reused iframe id starts "fresh")
+ *  - removes stale IFRAME_TO_BOUNDARY[...] entries for those iframe ids
+ *  - resets QUESTION_IFRAMES / QUESTION_INPUTS / QUESTION_INPUTS_INPUT_EVENT
+ *    for this boundary to empty objects
+ *
+ * Without this, a new iframe instance that reuses the same iframe id and
+ * the same input element id as a previous instance is treated by the
+ * 'register-input-listener' handler as "already registered" (since
+ * Q_INPUTS[input.id] still contains that iframe id from the previous
+ * instance), causing the handler to return early without ever sending the
+ * 'initial-input' response. The iframe then times out after 5 seconds.
+ */
+function vle_reset_question_registry(boundaryId) {
+  if (QUESTION_IFRAMES[boundaryId]) {
+    for (const iframeId of Object.keys(QUESTION_IFRAMES[boundaryId])) {
+      delete IFRAMES[iframeId];
+      delete IFRAME_TO_BOUNDARY[iframeId];
+    }
+  }
+  QUESTION_IFRAMES[boundaryId] = {};
+  QUESTION_INPUTS[boundaryId] = {};
+  QUESTION_INPUTS_INPUT_EVENT[boundaryId] = {};
+}
+
 function vle_get_question_boundary(element) {
   let iter = element;
   while (iter) {
@@ -70,8 +114,11 @@ function vle_get_element(id) {
   return document.getElementById(id);
 }
 
- // Returns an input element scoped to the question that contains srciframe.
-
+/**
+ * Returns an input element scoped to the question that contains srciframe.
+ * Searches by name="stackapi_input_{name}" which matches renderInputs=inputPrefix.
+ * Scoped to the question boundary to prevent cross-question matches.
+ */
 function vle_get_input_element(name, srciframe) {
   const boundaryId = IFRAME_TO_BOUNDARY[srciframe];
   let scope = document;
@@ -80,7 +127,7 @@ function vle_get_input_element(name, srciframe) {
     if (boundary) scope = boundary;
   }
 
-  // Primary -  exact name match for "stackapi_input_{name}"
+  // Primary: exact name match for "stackapi_input_{name}"
   let possible = scope.querySelector(`input[name="stackapi_input_${name}"]`);
   if (possible) return possible;
   possible = scope.querySelector(`textarea[name="stackapi_input_${name}"]`);
@@ -88,7 +135,7 @@ function vle_get_input_element(name, srciframe) {
   possible = scope.querySelector(`select[name="stackapi_input_${name}"]`);
   if (possible) return possible;
 
-  // Secondary - name ends with the input name (handles _val variants)
+  // Secondary: name ends with the input name (handles _val variants)
   possible = scope.querySelector(`input[name$="_${name}"]`);
   if (possible && possible.type !== 'radio') return possible;
   possible = scope.querySelector(`input[name$="_${name}"][type=radio]`);
@@ -96,7 +143,7 @@ function vle_get_input_element(name, srciframe) {
   possible = scope.querySelector(`select[name$="_${name}"]`);
   if (possible) return possible;
 
-  // Fallback - search whole document if boundary search failed
+  // Fallback: search whole document if boundary search failed
   if (scope !== document) {
     possible = document.querySelector(`input[name="stackapi_input_${name}"]`);
     if (possible) return possible;
@@ -112,7 +159,7 @@ function vle_update_input(inputelement) {
   inputelement.dispatchEvent(new Event('input'));
 }
 
- // Triggers MathJax re-typesetting on the modified element.
+//Triggers MathJax re-typesetting on the modified element.
 
 function vle_update_dom(modifiedsubtreerootelement) {
   if (window.MathJax && MathJax.typesetPromise) {
@@ -145,8 +192,8 @@ function is_evil_attribute(name, value) {
   return false;
 }
 
-// Message handling
- 
+//Message handling
+
 window.addEventListener("message", (e) => {
   if (!(typeof e.data === 'string' || e.data instanceof String)) return;
 
@@ -158,7 +205,7 @@ window.addEventListener("message", (e) => {
 
   // Get the per-question registry for this iframe
   const boundaryId = IFRAME_TO_BOUNDARY[msg.src];
-  const reg = boundaryId ? getQuestionRegistry(boundaryId) : { iframes: IFRAMES, inputs: {}, inputsInputEvent: {} };
+  if (boundaryId) getQuestionRegistry(boundaryId);
   const Q_IFRAMES = QUESTION_IFRAMES[boundaryId] || IFRAMES;
   const Q_INPUTS = QUESTION_INPUTS[boundaryId] || {};
   const Q_INPUTS_INPUT_EVENT = QUESTION_INPUTS_INPUT_EVENT[boundaryId] || {};
@@ -204,15 +251,19 @@ window.addEventListener("message", (e) => {
     }
 
     if (input.id in Q_INPUTS) {
-      if (Q_INPUTS[input.id].includes(msg.src)) return;
-      if (input.type !== 'radio') {
-        Q_INPUTS[input.id].push(msg.src);
-      } else {
-        for (const inp of document.querySelectorAll('input[type=radio][name=' + CSS.escape(input.name) + ']')) {
-          if (!(inp.id in Q_INPUTS)) Q_INPUTS[inp.id] = [];
-          Q_INPUTS[inp.id].push(msg.src);
+      if (!Q_INPUTS[input.id].includes(msg.src)) {
+        if (input.type !== 'radio') {
+          Q_INPUTS[input.id].push(msg.src);
+        } else {
+          for (const inp of document.querySelectorAll('input[type=radio][name=' + CSS.escape(input.name) + ']')) {
+            if (!(inp.id in Q_INPUTS)) Q_INPUTS[inp.id] = [];
+            if (!Q_INPUTS[inp.id].includes(msg.src)) Q_INPUTS[inp.id].push(msg.src);
+          }
         }
       }
+      // Always send the initial-input response, even if this iframe/input
+      // pair was already registered (e.g. duplicate registration request).
+      IFRAMES[msg.src].contentWindow.postMessage(JSON.stringify(response), '*');
     } else {
       if (input.type !== 'radio') {
         Q_INPUTS[input.id] = [msg.src];
@@ -222,7 +273,7 @@ window.addEventListener("message", (e) => {
           resp['value'] = input.type === 'checkbox' ? input.checked : input.value;
           for (const tgt of Q_INPUTS[input.id]) {
             resp['tgt'] = tgt;
-            IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
+            if (IFRAMES[tgt]) IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
           }
         });
       } else {
@@ -234,35 +285,31 @@ window.addEventListener("message", (e) => {
             const resp = { version: 'STACK-JS:1.0.0', type: 'changed-input', name: msg.name, value: inp.value };
             for (const tgt of Q_INPUTS[inp.id]) {
               resp['tgt'] = tgt;
-              IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
+              if (IFRAMES[tgt]) IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
             }
           });
         });
       }
-    }
 
-    if (('track-input' in msg) && msg['track-input'] && input.type !== 'radio') {
-      if (input.id in Q_INPUTS_INPUT_EVENT) {
-        if (Q_INPUTS_INPUT_EVENT[input.id].includes(msg.src)) return;
-        Q_INPUTS_INPUT_EVENT[input.id].push(msg.src);
-      } else {
-        Q_INPUTS_INPUT_EVENT[input.id] = [msg.src];
-        input.addEventListener('input', () => {
-          if (DISABLE_CHANGES) return;
-          const resp = { version: 'STACK-JS:1.0.0', type: 'changed-input', name: msg.name };
-          resp['value'] = input.type === 'checkbox' ? input.checked : input.value;
-          for (const tgt of Q_INPUTS_INPUT_EVENT[input.id]) {
-            resp['tgt'] = tgt;
-            IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
+      if (('track-input' in msg) && msg['track-input'] && input.type !== 'radio') {
+        if (input.id in Q_INPUTS_INPUT_EVENT) {
+          if (!Q_INPUTS_INPUT_EVENT[input.id].includes(msg.src)) {
+            Q_INPUTS_INPUT_EVENT[input.id].push(msg.src);
           }
-        });
+        } else {
+          Q_INPUTS_INPUT_EVENT[input.id] = [msg.src];
+          input.addEventListener('input', () => {
+            if (DISABLE_CHANGES) return;
+            const resp = { version: 'STACK-JS:1.0.0', type: 'changed-input', name: msg.name };
+            resp['value'] = input.type === 'checkbox' ? input.checked : input.value;
+            for (const tgt of Q_INPUTS_INPUT_EVENT[input.id]) {
+              resp['tgt'] = tgt;
+              if (IFRAMES[tgt]) IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(resp), '*');
+            }
+          });
+        }
       }
-    }
 
-    if (!Q_INPUTS[input.id].includes(msg.src) ||
-        !(input.id in Q_INPUTS) || !Q_INPUTS[input.id].includes(msg.src)) {
-      IFRAMES[msg.src].contentWindow.postMessage(JSON.stringify(response), '*');
-    } else if (response.type === 'initial-input') {
       IFRAMES[msg.src].contentWindow.postMessage(JSON.stringify(response), '*');
     }
     break;
@@ -287,7 +334,7 @@ window.addEventListener("message", (e) => {
     response.value = msg.value;
     if (Q_INPUTS[input.id]) {
       for (const tgt of Q_INPUTS[input.id]) {
-        if (tgt !== msg.src) {
+        if (tgt !== msg.src && IFRAMES[tgt]) {
           response.tgt = tgt;
           IFRAMES[tgt].contentWindow.postMessage(JSON.stringify(response), '*');
         }

@@ -206,6 +206,17 @@ function send(qfile, qname, qprefix) {
         document.getElementById(qprefix + 'formatcorrectresponse').innerHTML = correctAnswers;
         document.getElementById(qprefix + 'stackapi_correct').style.display = 'none';
 
+        // IMPORTANT: clear stale per-question iframe/input registry state
+        // before re-creating this question's iframes. Without this, a
+        // re-rendered iframe that reuses the same iframe id and the same
+        // input element id as the previous instance is treated as "already
+        // registered" by stackjsvle.js, which then never posts back the
+        // 'initial-input' response — the iframe's STACK-JS client times out
+        // after 5s ("No response to input registration of ... in 5s.") and
+        // never renders its drag-and-drop UI.
+        if (typeof vle_reset_question_registry === 'function') {
+          vle_reset_question_registry(qprefix + 'boundary');
+        }
         createIframes(json.iframes);
         runMathJax();
       } catch (e) {
@@ -226,6 +237,12 @@ function send(qfile, qname, qprefix) {
   });
 }
 
+/**
+ * Wire the submit button for a question after each render.
+ * Clones the button to remove any previously attached listeners, then
+ * attaches a fresh click handler that reads qfile/qname/seed from the
+ * current per-question state at click time — never from a stale closure.
+ */
 function wireSubmitButton(qprefix, qfile, qname) {
   const qtext = document.getElementById(qprefix + 'stackapi_qtext');
   if (!qtext) return;
@@ -266,6 +283,9 @@ function validate(element, qfile, qname, qprefix) {
         if (el) {
           el.innerHTML = wrap_math(validationHTML);
           el.classList.toggle('validation', !!validationHTML);
+        }
+        if (typeof vle_reset_question_registry === 'function') {
+          vle_reset_question_registry(qprefix + 'boundary');
         }
         createIframes(json.iframes);
         runMathJax();
@@ -337,6 +357,9 @@ function answer(qfile, qname, qprefix, seed) {
             element.innerHTML = wrap_math(fb);
           }
         }
+        if (typeof vle_reset_question_registry === 'function') {
+          vle_reset_question_registry(qprefix + 'boundary');
+        }
         createIframes(json.iframes);
         runMathJax();
       } catch (e) {
@@ -402,7 +425,7 @@ function download(filename, fileid, qfile, qname, qprefix, seed) {
 }
 
 function renameIframeHolders() {
-  for (const iframe of document.querySelectorAll(`[id^=stack-iframe-holder]:not([id$=old]`)) {
+  for (const iframe of document.querySelectorAll(`[id^=stack-iframe-holder]:not([id$=old])`)) {
     iframe.id = iframe.id + '_old';
   }
 }
