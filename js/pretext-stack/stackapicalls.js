@@ -16,8 +16,7 @@ const stackstring = {
   "api_which_typed": "which can be typed as follows"
 };
 
-// Per-question state map: keyed by qprefix.
-// Each entry holds { timeOutHandler, submitSeed, qfile, qname }
+// per-question state, keyed by qprefix: timers, last seed used, qfile/qname
 const questionState = {};
 
 function getState(qprefix) {
@@ -27,12 +26,13 @@ function getState(qprefix) {
   return questionState[qprefix];
 }
 
+// wrap inline/display maths in spans so MathJax knows what to typeset
 function wrap_math(content) {
   content = content.replace(/(?<!\\)(\\\(.*?(?<!\\)\\\))/gs, "<span class=\"process-math\">$1</span>");
   return content.replace(/(?<!\\)(\\\[.*?(?<!\\)\\\])/gs, "<span class=\"process-math\">$1</span>");
 }
 
-// Create data for API call.
+// build the payload the STACK API expects for render/validate/grade calls
 async function collectData(qfile, qname, qprefix) {
   let res = "";
   await getQuestionFile(qfile, qname).then((response) => {
@@ -49,7 +49,8 @@ async function collectData(qfile, qname, qprefix) {
   return res;
 }
 
-// Collect answer inputs ONLY from this question's output div.
+// grab the current answer values, but only from this question's own output
+// div — otherwise we'd pick up inputs belonging to other questions on the page
 function collectAnswer(qprefix) {
   const outputDiv = document.getElementById(qprefix + 'output');
   const scope = outputDiv || document;
@@ -65,7 +66,7 @@ function collectAnswer(qprefix) {
   for (const el of hiddenInputs) {
     if (!el.name) continue;
     const key = el.name.slice(inputPrefix.length);
-    // Only set if not already captured (don't overwrite a user-typed value)
+    // don't clobber a value we already picked up from a real input
     if (!(key in res)) {
       res[key] = el.value;
     }
@@ -94,6 +95,7 @@ function processNodes(res, nodes) {
   return res;
 }
 
+// fetch and render a fresh instance of the question into the page
 function send(qfile, qname, qprefix) {
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/render';
@@ -115,7 +117,7 @@ function send(qfile, qname, qprefix) {
         const inputs = json.questioninputs;
         const seed = json.questionseed;
 
-        // Store seed and question identity per question
+        // remember the seed/qfile/qname for this question so Submit can use them later
         const state = getState(qprefix);
         state.submitSeed = seed;
         state.qfile = qfile;
@@ -128,13 +130,18 @@ function send(qfile, qname, qprefix) {
           const input = inputs[name];
           if (!input) continue;
           question = question.replace(`[[input:${name}]]`, input.render);
-          question = question.replace(`[[validation:${name}]]`, `<span name='${validationPrefix + name}'></span>`);
+          // 'empty' class needed so Parson's/drag-drop CSS shows/hides this correctly
+          question = question.replace(
+            `[[validation:${name}]]`,
+            `<span name='${validationPrefix + name}' class='stackinputfeedback empty'></span>`
+          );
           question = question.replace(
             /javascript:download\(([^,]+?),([^,]+?)\)/,
             `javascript:download($1,$2, '${qfile}', '${qname}', '${qprefix}', ${seed})`
           );
           question = wrap_math(question);
 
+          // build up the "correct answer" text shown after grading
           if (input.samplesolutionrender && name !== 'remember') {
             correctAnswers += `<p>A correct answer is: `;
             if (input.samplesolutionrender.substring(0, 1) === '<') {
@@ -164,6 +171,7 @@ function send(qfile, qname, qprefix) {
           }
         }
 
+        // swap in real URLs for any plots/images the question references
         for (const [name, file] of Object.entries(json.questionassets)) {
           const plotUrl = getPlotUrl(file);
           question = question.replace(name, plotUrl);
@@ -171,12 +179,28 @@ function send(qfile, qname, qprefix) {
           correctAnswers = correctAnswers.replace(name, plotUrl);
         }
 
+        // the API renders cors.php links as relative, which resolve against
+        // our localhost server instead of the STACK API — make them absolute
+        question = question.replace(
+          /(?<![:/])(cors\.php)/g,
+          `${stack_api_url}/$1`
+        );
+
+        // API-rendered ids (e.g. id="stackapi_input_ans1") aren't aware of
+        // which question they belong to, so two questions using an input
+        // called "ans1" end up with duplicate ids on the page. Prefix every
+        // id/for with this question's qprefix to keep them unique.
+        question = question.replace(
+          /\b(id|for)=(["'])stackapi_/g,
+          `$1=$2${qprefix}stackapi_`
+        );
+
         question = replaceFeedbackTags(question, qprefix);
         const qoutput = document.getElementById(qprefix + 'output');
         qoutput.innerHTML = question;
         document.getElementById(qprefix + 'stackapi_qtext').style.display = 'block';
 
-        // Set up validation listeners scoped to this question's output div
+        // debounce typing — validate 1s after the user stops, per input
         for (const inputName of Object.keys(inputs)) {
           const inputElements = qoutput.querySelectorAll(`[name^="${inputPrefix + inputName}"]`);
           for (const inputElement of inputElements) {
@@ -197,6 +221,7 @@ function send(qfile, qname, qprefix) {
           sampleText = replaceFeedbackTags(sampleText, qprefix);
           document.getElementById(qprefix + 'generalfeedback').innerHTML = wrap_math(sampleText);
         }
+        // reset everything to a fresh state for the new question
         document.getElementById(qprefix + 'stackapi_generalfeedback').style.display = 'none';
         document.getElementById(qprefix + 'stackapi_score').style.display = 'none';
         document.getElementById(qprefix + 'stackapi_validity').innerText = '';
@@ -206,14 +231,9 @@ function send(qfile, qname, qprefix) {
         document.getElementById(qprefix + 'formatcorrectresponse').innerHTML = correctAnswers;
         document.getElementById(qprefix + 'stackapi_correct').style.display = 'none';
 
-        // IMPORTANT: clear stale per-question iframe/input registry state
-        // before re-creating this question's iframes. Without this, a
-        // re-rendered iframe that reuses the same iframe id and the same
-        // input element id as the previous instance is treated as "already
-        // registered" by stackjsvle.js, which then never posts back the
-        // 'initial-input' response — the iframe's STACK-JS client times out
-        // after 5s ("No response to input registration of ... in 5s.") and
-        // never renders its drag-and-drop UI.
+        // clear out old iframe/input registrations before building new ones,
+        // otherwise reused ids get treated as already-registered and the
+        // drag-drop UI never shows up
         if (typeof vle_reset_question_registry === 'function') {
           vle_reset_question_registry(qprefix + 'boundary');
         }
@@ -228,7 +248,7 @@ function send(qfile, qname, qprefix) {
 
   collectData(qfile, qname, qprefix).then((data) => {
     if (!data) return;
-    delete data.answers;
+    delete data.answers; // not needed for a fresh render
     http.send(JSON.stringify(data));
     const questioncontainer = document.getElementById(qprefix + 'stack').parentElement;
     if (questioncontainer.getBoundingClientRect().top < 0) {
@@ -237,12 +257,8 @@ function send(qfile, qname, qprefix) {
   });
 }
 
-/**
- * Wire the submit button for a question after each render.
- * Clones the button to remove any previously attached listeners, then
- * attaches a fresh click handler that reads qfile/qname/seed from the
- * current per-question state at click time — never from a stale closure.
- */
+// (re)wire the submit button after each render. Cloning it first wipes any
+// listener from a previous render, so we never end up double-submitting.
 function wireSubmitButton(qprefix, qfile, qname) {
   const qtext = document.getElementById(qprefix + 'stackapi_qtext');
   if (!qtext) return;
@@ -257,6 +273,7 @@ function wireSubmitButton(qprefix, qfile, qname) {
   });
 }
 
+// check a single input as the user types, without grading the whole question
 function validate(element, qfile, qname, qprefix) {
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/validate';
@@ -281,8 +298,19 @@ function validate(element, qfile, qname, qprefix) {
           ? outputDiv.querySelector(`[name="${validationPrefix + answerName}"]`)
           : document.getElementsByName(validationPrefix + answerName)[0];
         if (el) {
-          el.innerHTML = wrap_math(validationHTML);
-          el.classList.toggle('validation', !!validationHTML);
+          // same cors.php fix as in send(), validation responses can contain it too
+          const safeValidHTML = validationHTML
+            ? validationHTML.replace(/(?<![:/])(cors\.php)/g, `${stack_api_url}/$1`)
+            : validationHTML;
+          el.innerHTML = wrap_math(safeValidHTML);
+          // toggle empty/validation class so the CSS shows/hides the feedback span
+          if (validationHTML) {
+            el.classList.remove('empty');
+            el.classList.add('validation');
+          } else {
+            el.classList.remove('validation');
+            el.classList.add('empty');
+          }
         }
         if (typeof vle_reset_question_registry === 'function') {
           vle_reset_question_registry(qprefix + 'boundary');
@@ -301,6 +329,7 @@ function validate(element, qfile, qname, qprefix) {
   });
 }
 
+// submit the question for grading
 function answer(qfile, qname, qprefix, seed) {
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/grade';
@@ -344,6 +373,7 @@ function answer(qfile, qname, qprefix, seed) {
         } else {
           specificFeedbackElement.classList.remove('feedback');
         }
+        // fill in per-PRT feedback and the marks breakdown for each part
         for (let [name, fb] of Object.entries(feedback)) {
           for (const [fname, file] of Object.entries(json.gradingassets)) {
             fb = fb.replace(fname, getPlotUrl(file));
@@ -369,6 +399,7 @@ function answer(qfile, qname, qprefix, seed) {
     }
   };
 
+  // clear old feedback before the new grading result comes back
   const specificFeedbackElement = document.getElementById(qprefix + 'specificfeedback');
   specificFeedbackElement.innerHTML = "";
   specificFeedbackElement.classList.remove('feedback');
@@ -387,12 +418,13 @@ function answer(qfile, qname, qprefix, seed) {
       console.error('collectData returned empty for', qprefix);
       return;
     }
-    // Override seed with the one stored at render time (not a fresh random seed)
+    // use the seed from when the question was rendered, not a new random one
     data.seed = seed;
     http.send(JSON.stringify(data));
   });
 }
 
+// download a file attached to the question (e.g. a generated worksheet)
 function download(filename, fileid, qfile, qname, qprefix, seed) {
   const http = new XMLHttpRequest();
   const url = stack_api_url + '/download';
@@ -424,19 +456,36 @@ function download(filename, fileid, qfile, qname, qprefix, seed) {
   });
 }
 
+// rename old iframe holders out of the way so new ones don't collide with them
 function renameIframeHolders() {
   for (const iframe of document.querySelectorAll(`[id^=stack-iframe-holder]:not([id$=old])`)) {
     iframe.id = iframe.id + '_old';
   }
 }
 
+// build each iframe's srcdoc and hand it off to create_iframe in stackjsvle.js
 function createIframes(iframes) {
   for (const iframe of iframes) {
-    iframe[1] = iframe[1].replace('<head>', `<head><base href="${stack_api_url}/" />`);
+    // STACK API content has relative URLs like cors.php?name=sortable.min.css
+    // which, inside a sandboxed srcdoc iframe, resolve against our localhost
+    // page instead of the API server. Inject a <base href> and also rewrite
+    // any relative src/href directly, since not every browser honours base
+    // href for things fetched dynamically by scripts inside the iframe.
+    const apiBase = stack_api_url.replace(/\/$/, ''); // no trailing slash
+    iframe[1] = iframe[1]
+      .replace(
+        /<head(\s[^>]*)?>/i,
+        (match) => `${match}<base href="${apiBase}/" />`
+      )
+      .replace(
+        /((?:src|href)\s*=\s*["'])(?!https?:\/\/|\/\/|data:|blob:|#|javascript:)([^"']+["'])/gi,
+        (match, prefix, rest) => `${prefix}${apiBase}/${rest}`
+      );
     create_iframe(...iframe);
   }
 }
 
+// turn [[feedback:name]] placeholders into real divs the grader can fill in
 function replaceFeedbackTags(text, qprefix) {
   let result = text;
   const feedbackTags = text.match(/\[\[feedback:.*?\]\]/g);
@@ -448,6 +497,7 @@ function replaceFeedbackTags(text, qprefix) {
   return result;
 }
 
+// load and parse the question's source XML file
 async function getQuestionFile(questionURL, questionName) {
   let res = "";
   if (questionURL) {
@@ -458,6 +508,7 @@ async function getQuestionFile(questionURL, questionName) {
   return res;
 }
 
+// pull the named STACK question (or the first one) out of the quiz XML
 function loadQuestionFromFile(fileContents, questionName) {
   const parser = new DOMParser();
   const xmlDoc = parser.parseFromString(fileContents, "text/xml");
@@ -485,6 +536,7 @@ function runMathJax() {
   }
 }
 
+// find every STACK question on the page and build its UI shell
 function createQuestionBlocks() {
   const questionBlocks = document.getElementsByClassName("que stack");
   let i = 0;
@@ -529,6 +581,7 @@ function createQuestionBlocks() {
   }
 }
 
+// make section headers clickable to expand/collapse their content
 function addCollapsibles() {
   const collapsibles = document.querySelectorAll(".level2>h2, .stack>h2");
   for (let i = 0; i < collapsibles.length; i++) {

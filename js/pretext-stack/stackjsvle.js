@@ -1,35 +1,21 @@
 /**
  * stackjsvle.js — PreTeXt port of the STACK iframe VLE communication layer.
  *
- * Key differences from the original Moodle version:
- *
- * 1. IFRAMES/INPUTS/INPUTS_INPUT_EVENT are now per-question Maps keyed by
- *    question boundary id (e.g. "q1_boundary"), not global objects.
- *    This prevents cross-question interference when multiple Parson's/drag-drop
- *    questions are active on the same page simultaneously.
- *
- * 2. vle_get_question_boundary() finds the PreTeXt question container
- *    (id ending in "_boundary", set by createQuestionBlocks) instead of
- *    Moodle's ".formulation" class which does not exist in PreTeXt.
- *
- * 3. vle_get_input_element() searches by name="stackapi_input_{name}" which
- *    matches the renderInputs=inputPrefix convention in stackapicalls.js.
- *    Search is scoped to the question boundary to avoid cross-question matches.
- *
+ * Differences from the Moodle version:
+ * 1. Iframe/input registries are per-question (keyed by boundary id) instead
+ *    of global, so multiple STACK questions on one page don't clash.
+ * 2. vle_get_question_boundary() looks for our "_boundary" id instead of
+ *    Moodle's .formulation class.
+ * 3. vle_get_input_element() matches stackapi_input_{name}, scoped to the
+ *    question boundary.
  * 4. vle_update_dom() uses MathJax.typesetPromise() instead of Moodle's
- *    CustomEvents.notifyFilterContentUpdated() which does not exist in PreTeXt.
- *
- * 5. NEW: vle_reset_question_registry(boundaryId) — clears all per-question
- *    registry state (iframes, input listener maps) for a question before it
- *    is re-rendered (e.g. "Show new example question"). Without this, a
- *    freshly created iframe that reuses the same iframe id AND the same
- *    input element id as the previous instance will be considered "already
- *    registered" by the stale Q_INPUTS map. The 'register-input-listener'
- *    handler then `return`s early without ever posting back the
- *    'initial-input' response, and the iframe's STACK-JS client times out
- *    after 5s with "No response to input registration of ... in 5s." and
- *    never renders its drag-and-drop UI. Calling this before createIframes()
- *    on every render prevents that stale state from persisting.
+ *    notifyFilterContentUpdated().
+ * 5. vle_reset_question_registry() clears old registry state before a
+ *    question re-renders, so reused iframe/input ids don't get treated as
+ *    "already registered" and silently drop their response.
+ * 6. create_iframe() adds allow-same-origin to the sandbox for trusted
+ *    (non-evil) iframes, so <base href> actually governs relative URLs
+ *    fetched from inside the iframe.
  *
  * @copyright  2023 Aalto University
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
@@ -37,19 +23,18 @@
 
 'use strict';
 
-// Per-question registries — keyed by question boundary element id.
-// Each question gets its own isolated IFRAMES, INPUTS, INPUTS_INPUT_EVENT map.
-const QUESTION_IFRAMES = {};          // { boundaryId: { iframeId: iframeElement } }
-const QUESTION_INPUTS = {};           // { boundaryId: { inputId: [iframeId, ...] } }
-const QUESTION_INPUTS_INPUT_EVENT = {}; // { boundaryId: { inputId: [iframeId, ...] } }
-const IFRAME_TO_BOUNDARY = {};        // { iframeId: boundaryId } — reverse lookup
+// registries, one set of entries per question boundary id
+const QUESTION_IFRAMES = {};
+const QUESTION_INPUTS = {};
+const QUESTION_INPUTS_INPUT_EVENT = {};
+const IFRAME_TO_BOUNDARY = {}; // iframe id -> which question it belongs to
 
-// Legacy global IFRAMES still needed by create_iframe which registers new iframes.
-let IFRAMES = {};
+let IFRAMES = {}; // flat lookup, all iframes regardless of question
 
-let DISABLE_CHANGES = false;
+let DISABLE_CHANGES = false; // guards against echoing changes back to sender
 
 function getQuestionRegistry(boundaryId) {
+  // create empty registry entries the first time we see this question
   if (!QUESTION_IFRAMES[boundaryId]) {
     QUESTION_IFRAMES[boundaryId] = {};
     QUESTION_INPUTS[boundaryId] = {};
@@ -62,27 +47,8 @@ function getQuestionRegistry(boundaryId) {
   };
 }
 
-/**
- * Clear all registry state associated with a question boundary.
- *
- * Called by stackapicalls.js immediately before re-rendering a question's
- * iframes (initial render, "Show new example question", or any re-render
- * that calls createIframes() again for the same boundary).
- *
- * This:
- *  - removes stale IFRAMES[...] entries for any iframe ids previously
- *    registered under this boundary (so a reused iframe id starts "fresh")
- *  - removes stale IFRAME_TO_BOUNDARY[...] entries for those iframe ids
- *  - resets QUESTION_IFRAMES / QUESTION_INPUTS / QUESTION_INPUTS_INPUT_EVENT
- *    for this boundary to empty objects
- *
- * Without this, a new iframe instance that reuses the same iframe id and
- * the same input element id as a previous instance is treated by the
- * 'register-input-listener' handler as "already registered" (since
- * Q_INPUTS[input.id] still contains that iframe id from the previous
- * instance), causing the handler to return early without ever sending the
- * 'initial-input' response. The iframe then times out after 5 seconds.
- */
+// wipe a question's registry before re-rendering it (e.g. "new example
+// question" button) so stale iframe/input ids don't block re-registration
 function vle_reset_question_registry(boundaryId) {
   if (QUESTION_IFRAMES[boundaryId]) {
     for (const iframeId of Object.keys(QUESTION_IFRAMES[boundaryId])) {
@@ -95,6 +61,7 @@ function vle_reset_question_registry(boundaryId) {
   QUESTION_INPUTS_INPUT_EVENT[boundaryId] = {};
 }
 
+// walk up the DOM from an element to find its enclosing question container
 function vle_get_question_boundary(element) {
   let iter = element;
   while (iter) {
@@ -114,11 +81,8 @@ function vle_get_element(id) {
   return document.getElementById(id);
 }
 
-/**
- * Returns an input element scoped to the question that contains srciframe.
- * Searches by name="stackapi_input_{name}" which matches renderInputs=inputPrefix.
- * Scoped to the question boundary to prevent cross-question matches.
- */
+// find the actual input/textarea/select for a STACK input name, scoped to
+// the question that owns srciframe so two questions can't see each other's inputs
 function vle_get_input_element(name, srciframe) {
   const boundaryId = IFRAME_TO_BOUNDARY[srciframe];
   let scope = document;
@@ -127,7 +91,7 @@ function vle_get_input_element(name, srciframe) {
     if (boundary) scope = boundary;
   }
 
-  // Primary: exact name match for "stackapi_input_{name}"
+  // try exact match first
   let possible = scope.querySelector(`input[name="stackapi_input_${name}"]`);
   if (possible) return possible;
   possible = scope.querySelector(`textarea[name="stackapi_input_${name}"]`);
@@ -135,7 +99,7 @@ function vle_get_input_element(name, srciframe) {
   possible = scope.querySelector(`select[name="stackapi_input_${name}"]`);
   if (possible) return possible;
 
-  // Secondary: name ends with the input name (handles _val variants)
+  // fall back to suffix match (covers _val variants etc.)
   possible = scope.querySelector(`input[name$="_${name}"]`);
   if (possible && possible.type !== 'radio') return possible;
   possible = scope.querySelector(`input[name$="_${name}"][type=radio]`);
@@ -143,7 +107,7 @@ function vle_get_input_element(name, srciframe) {
   possible = scope.querySelector(`select[name$="_${name}"]`);
   if (possible) return possible;
 
-  // Fallback: search whole document if boundary search failed
+  // last resort: search the whole page if the scoped search failed
   if (scope !== document) {
     possible = document.querySelector(`input[name="stackapi_input_${name}"]`);
     if (possible) return possible;
@@ -155,12 +119,12 @@ function vle_get_input_element(name, srciframe) {
 }
 
 function vle_update_input(inputelement) {
+  // fire both events so anything listening for either still works
   inputelement.dispatchEvent(new Event('change'));
   inputelement.dispatchEvent(new Event('input'));
 }
 
-//Triggers MathJax re-typesetting on the modified element.
-
+// re-typeset maths after we've changed something in the DOM
 function vle_update_dom(modifiedsubtreerootelement) {
   if (window.MathJax && MathJax.typesetPromise) {
     MathJax.typesetPromise([modifiedsubtreerootelement])
@@ -170,6 +134,8 @@ function vle_update_dom(modifiedsubtreerootelement) {
   }
 }
 
+// strip scripts/styles and any dangerous attributes before inserting
+// iframe-supplied HTML into the page
 function vle_html_sanitize(src) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(src, "text/html");
@@ -184,7 +150,7 @@ function vle_html_sanitize(src) {
 
 function is_evil_attribute(name, value) {
   const lcname = name.toLowerCase();
-  if (lcname.startsWith('on')) return true;
+  if (lcname.startsWith('on')) return true; // inline event handlers
   if (lcname === 'src' || lcname.endsWith('href')) {
     const lcvalue = value.replace(/\s+/g, '').toLowerCase();
     if (lcvalue.includes('javascript:') || lcvalue.includes('data:text')) return true;
@@ -192,7 +158,7 @@ function is_evil_attribute(name, value) {
   return false;
 }
 
-//Message handling
+// postMessage handling — this is how the STACK-JS iframes talk to us
 
 window.addEventListener("message", (e) => {
   if (!(typeof e.data === 'string' || e.data instanceof String)) return;
@@ -200,10 +166,10 @@ window.addEventListener("message", (e) => {
   let msg = null;
   try { msg = JSON.parse(e.data); } catch (e) { return; }
 
+  // ignore anything that isn't a STACK-JS message from a known iframe
   if (!(('version' in msg) && msg.version.startsWith('STACK-JS'))) return;
   if (!(('src' in msg) && ('type' in msg) && (msg.src in IFRAMES))) return;
 
-  // Get the per-question registry for this iframe
   const boundaryId = IFRAME_TO_BOUNDARY[msg.src];
   if (boundaryId) getQuestionRegistry(boundaryId);
   const Q_IFRAMES = QUESTION_IFRAMES[boundaryId] || IFRAMES;
@@ -216,6 +182,7 @@ window.addEventListener("message", (e) => {
 
   switch (msg.type) {
   case 'register-input-listener':
+    // iframe wants to bind to a real input on the page
     input = vle_get_input_element(msg.name, msg.src);
     if (input === null) {
       response.type = 'error';
@@ -229,6 +196,7 @@ window.addEventListener("message", (e) => {
     response.name = msg.name;
     response.tgt = msg.src;
 
+    // report current value back, format depends on input type
     if (input.nodeName.toLowerCase() === 'select') {
       response.value = input.value;
       response['input-type'] = 'select';
@@ -243,6 +211,7 @@ window.addEventListener("message", (e) => {
       response['input-readonly'] = input.hasAttribute('readonly');
     }
     if (input.type === 'radio') {
+      // radio groups need the checked option, not just this one element
       response['input-readonly'] = input.hasAttribute('disabled');
       response.value = '';
       for (const inp of document.querySelectorAll('input[type=radio][name=' + CSS.escape(input.name) + ']')) {
@@ -251,6 +220,7 @@ window.addEventListener("message", (e) => {
     }
 
     if (input.id in Q_INPUTS) {
+      // already tracking this input, just add this iframe as a listener
       if (!Q_INPUTS[input.id].includes(msg.src)) {
         if (input.type !== 'radio') {
           Q_INPUTS[input.id].push(msg.src);
@@ -261,10 +231,9 @@ window.addEventListener("message", (e) => {
           }
         }
       }
-      // Always send the initial-input response, even if this iframe/input
-      // pair was already registered (e.g. duplicate registration request).
       IFRAMES[msg.src].contentWindow.postMessage(JSON.stringify(response), '*');
     } else {
+      // first time seeing this input — wire up change listeners
       if (input.type !== 'radio') {
         Q_INPUTS[input.id] = [msg.src];
         input.addEventListener('change', () => {
@@ -277,6 +246,7 @@ window.addEventListener("message", (e) => {
           }
         });
       } else {
+        // radios: bind every option in the group together
         const radgroup = document.querySelectorAll('input[type=radio][name=' + CSS.escape(input.name) + ']');
         for (const inp of radgroup) Q_INPUTS[inp.id] = [msg.src];
         radgroup.forEach(inp => {
@@ -291,6 +261,7 @@ window.addEventListener("message", (e) => {
         });
       }
 
+      // optionally also track every keystroke, not just on blur/change
       if (('track-input' in msg) && msg['track-input'] && input.type !== 'radio') {
         if (input.id in Q_INPUTS_INPUT_EVENT) {
           if (!Q_INPUTS_INPUT_EVENT[input.id].includes(msg.src)) {
@@ -315,6 +286,7 @@ window.addEventListener("message", (e) => {
     break;
 
   case 'changed-input':
+    // iframe wants to push a new value into a real input on the page
     input = vle_get_input_element(msg.name, msg.src);
     if (input === null) {
       IFRAMES[msg.src].contentWindow.postMessage(JSON.stringify({
@@ -323,12 +295,13 @@ window.addEventListener("message", (e) => {
       }), '*');
       return;
     }
-    DISABLE_CHANGES = true;
+    DISABLE_CHANGES = true; // stop our own listener echoing this straight back
     if (input.type === 'checkbox') input.checked = msg.value;
     else input.value = msg.value;
     vle_update_input(input);
     DISABLE_CHANGES = false;
 
+    // tell every other iframe watching this input about the new value
     response.type = 'changed-input';
     response.name = msg.name;
     response.value = msg.value;
@@ -356,6 +329,7 @@ window.addEventListener("message", (e) => {
     break;
 
   case 'change-content':
+    // iframe wants to replace the contents of some element on the page
     element = vle_get_element(msg.target);
     if (element === null) {
       response.type = 'error';
@@ -369,6 +343,7 @@ window.addEventListener("message", (e) => {
     break;
 
   case 'get-content':
+    // iframe is asking what's currently in some element
     element = vle_get_element(msg.target);
     response.type = 'xfer-content';
     response.tgt = msg.src;
@@ -378,6 +353,7 @@ window.addEventListener("message", (e) => {
     break;
 
   case 'resize-frame':
+    // iframe is telling us it needs more/less room
     element = IFRAMES[msg.src].parentElement;
     element.style.width = msg.width;
     element.style.height = msg.height;
@@ -394,6 +370,7 @@ window.addEventListener("message", (e) => {
 
   case 'initial-input':
   case 'error':
+    // these are responses to messages we sent, nothing to do here
     break;
 
   default:
@@ -404,6 +381,7 @@ window.addEventListener("message", (e) => {
   }
 });
 
+// builds and inserts a sandboxed iframe for a STACK question component
 function create_iframe(iframeid, content, targetdivid, title, scrolling, evil) {
   const frm = document.createElement('iframe');
   frm.id = iframeid;
@@ -418,14 +396,19 @@ function create_iframe(iframeid, content, targetdivid, title, scrolling, evil) {
   }
   frm.title = title;
   frm.referrerpolicy = 'no-referrer';
-  if (!evil) frm.sandbox = 'allow-scripts allow-downloads';
+  if (!evil) {
+    // allow-same-origin lets <base href> control relative URL resolution
+    // inside the iframe — content here comes from our own STACK API, not
+    // arbitrary user input, so this is safe
+    frm.sandbox = 'allow-scripts allow-downloads allow-same-origin';
+  }
   frm.srcdoc = content;
 
   const targetDiv = document.getElementById(targetdivid);
   targetDiv.replaceChildren(frm);
   IFRAMES[iframeid] = frm;
 
-  // Register this iframe in the per-question registry by finding its question boundary
+  // remember which question this iframe belongs to
   const boundary = vle_get_question_boundary(targetDiv);
   if (boundary && boundary.id) {
     IFRAME_TO_BOUNDARY[iframeid] = boundary.id;
